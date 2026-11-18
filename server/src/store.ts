@@ -1,4 +1,5 @@
 import { db, now } from './db.js';
+import { parseVoice } from './voice-providers.js';
 import { hub } from './lib/hub.js';
 import type { Bot, LiveState, Row, RowBody, RowKind, Routine, Task } from './types.js';
 import { Cron } from 'croner';
@@ -28,7 +29,7 @@ export function toBot(r: any): Bot {
     kind: r.kind === 'room' ? 'room' : 'agent',
     pinned: !!r.pinned,
     effort: r.effort,
-    voice: r.voice ?? 'luna',
+    voice: (() => { const v = parseVoice(r.voice); return `${v.provider}:${v.id}`; })(),
     voiceSpeed: r.voice_speed ?? 1,
     voiceLanguage: r.voice_language ?? 'auto',
     model: r.model ?? null,

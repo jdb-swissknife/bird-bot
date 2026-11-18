@@ -24,8 +24,21 @@ export const env = {
   appUrl: process.env.APP_URL ?? 'http://localhost:5173',
   /** Public URL of this server, used for OAuth callbacks. */
   serverUrl: process.env.SERVER_URL ?? `http://localhost:${process.env.PORT ?? 8787}`,
-  xaiKey: req('XAI_API_KEY'),
+  /** Optional: X research (x_search) and the xAI voice backup. Empty = those features are off. */
+  xaiKey: process.env.XAI_API_KEY ?? '',
   xaiModel: process.env.XAI_MODEL ?? 'grok-4.7',
+  /** Optional: the OpenAI realtime voice backup. */
+  openaiKey: process.env.OPENAI_API_KEY ?? '',
+  openaiVoiceModel: process.env.OPENAI_VOICE_MODEL ?? 'gpt-realtime-2',
+  /** Speko: the primary voice (hosted voice agent over WebRTC), plus TTS preview, dictation and call summaries. */
+  spekoKey: process.env.SPEKO_API_KEY ?? '',
+  spekoBaseUrl: (process.env.SPEKO_BASE_URL ?? 'https://api.speko.dev').replace(/\/+$/, ''),
+  /** Name of the hosted Speko agent Bird-bot uses for voice; found or created at first use. */
+  spekoAgentName: process.env.SPEKO_VOICE_AGENT_NAME ?? 'Bird-bot Voice',
+  /** Voice providers to try, in order, when a call starts. The bot's chosen voice's provider goes first. */
+  voiceOrder: (process.env.VOICE_PROVIDERS ?? 'speko,openai,xai').split(',').map((s) => s.trim()).filter(Boolean),
+  /** Default voice for new bots / bots with no valid voice: provider:voiceId. */
+  defaultVoice: process.env.DEFAULT_VOICE ?? 'speko:a5136bf9-224c-4d76-b823-52bd5efcffcc',
   composioKey: req('COMPOSIO_API_KEY'),
   orgoKey: secret('ORGO_API_KEY'),
   sessionSecret: req('SESSION_SECRET'),
@@ -46,8 +59,10 @@ export const env = {
   mcpBaseUrl: (process.env.MCP_BASE_URL ?? `http://127.0.0.1:${process.env.PORT ?? 8787}`).replace(/\/+$/, ''),
   /** Extra MCP servers every managed bot gets, as a JSON object of Hermes `mcp_servers` entries (e.g. X's XMCP). */
   extraMcpServers: process.env.EXTRA_MCP_SERVERS ?? '',
-  primaryBotName: process.env.PRIMARY_BOT_NAME ?? 'Doug',
+  primaryBotName: process.env.PRIMARY_BOT_NAME ?? 'Bird-bot',
   primaryBotLabel: process.env.PRIMARY_BOT_LABEL ?? 'Chief of Staff',
+  /** Product name shown in prompts. */
+  appName: process.env.APP_NAME ?? 'Bird-bot',
 
   // ---- the one shared computer ----
   /** The Orgo computer every bot works on (one screen each). Empty = legacy one-box-per-user mode is not supported. */

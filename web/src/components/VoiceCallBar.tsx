@@ -97,6 +97,7 @@ export function VoiceCallBar() {
           <div className="vcall__title">
             <span className="vcall__name">{bot.name}</span>
             {v.status === 'live' && v.startedAt && <span className="vcall__time">{fmt(now - v.startedAt)}</span>}
+            {v.status === 'live' && v.providerName && <span className="vcall__time" title="Voice service carrying this call"> · {v.providerName}</span>}
           </div>
           <div className={`vcall__status${working && !v.speaking && !v.listening ? ' vcall__shimmer' : ''}`} aria-live="polite">
             {status}

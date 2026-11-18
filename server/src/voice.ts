@@ -13,6 +13,12 @@ import { enqueue } from './agent/loop.js';
 import { computerState } from './computer.js';
 import type { ActivityKind, EventBody, MessageBody, RowBody, VoiceCallRecord, VoiceOption } from './types.js';
 import { listMemories } from './engine-memory.js';
+import {
+  OPENAI_VOICES, PROVIDER_LABEL, availableProviders, endSpekoSession, ensureSpekoAgent, fallbackVoice, mintOpenAISession,
+  mintSpekoSession, parseVoice, providerAvailable, providerOrder, quickText, speko, spekoLanguage, spekoVoices, verifySpekoSignature,
+  type VoiceProvider,
+} from './voice-providers.js';
+import crypto from 'node:crypto';
 
 export const voiceApi = new Hono<AuthVars>();
 
@@ -42,6 +48,22 @@ export const LANGUAGES: { code: string; name: string }[] = [
 export const SPEEDS = [0.7, 0.85, 1, 1.15, 1.3, 1.5];
 
 let voiceCache: { at: number; voices: VoiceOption[] } | null = null;
+let allCache: { at: number; voices: VoiceOption[] } | null = null;
+
+/** Every voice the configured providers offer, as provider:id, Speko first. */
+async function listAllVoices(): Promise<VoiceOption[]> {
+  if (allCache && Date.now() - allCache.at < 3600_000) return allCache.voices;
+  const out: VoiceOption[] = [];
+  let ok = true;
+  if (providerAvailable('speko')) {
+    try { out.push(...(await spekoVoices())); } catch (e: any) { ok = false; console.warn('[voice] Speko voice list unavailable:', e?.message); }
+  }
+  if (providerAvailable('openai')) out.push(...OPENAI_VOICES.map((v) => ({ id: `openai:${v}`, name: `${v[0].toUpperCase()}${v.slice(1)} · OpenAI (backup)`, provider: 'openai' as const })));
+  if (providerAvailable('xai')) out.push(...(await listVoices()).map((v) => ({ ...v, id: `xai:${v.id}`, name: `${v.name} · xAI (backup)`, provider: 'xai' as const })));
+  allCache = { at: ok ? Date.now() : Date.now() - 3000_000, voices: out };
+  return out;
+}
+
 async function listVoices(): Promise<VoiceOption[]> {
   if (voiceCache && Date.now() - voiceCache.at < 3600_000) return voiceCache.voices;
   try {
@@ -65,7 +87,8 @@ const clampSpeed = (s: unknown) => {
 const langName = (code: string) => LANGUAGES.find((l) => l.code.toLowerCase() === code?.toLowerCase())?.name;
 function settingsOf(bot: any) {
   const language = langName(bot.voice_language) ? String(bot.voice_language) : 'auto';
-  return { voice: String(bot.voice || 'luna'), speed: clampSpeed(bot.voice_speed ?? 1), language };
+  const v = parseVoice(bot.voice);
+  return { voice: v.id, provider: v.provider, voiceKey: `${v.provider}:${v.id}`, speed: clampSpeed(bot.voice_speed ?? 1), language };
 }
 
 // ---------- helpers ----------
@@ -175,7 +198,7 @@ function voiceInstructions(userId: string, bot: any, language: string): string {
   const lang = language !== 'auto' ? langName(language) : null;
 
   return `# Who you are
-You are ${bot.name}, on a live voice call with ${firstName}, the person you work for. You are an AI Bot on their Grokbot team${bot.label ? `, and your job is: ${bot.label}` : ''}.${bot.description ? ` ${bot.description}` : ''}${bot.is_primary ? ` You are ${firstName}'s primary Bot and main point of contact.` : ''}
+You are ${bot.name}, on a live voice call with ${firstName}, the person you work for. You are an AI Bot on their ${env.appName} team${bot.label ? `, and your job is: ${bot.label}` : ''}.${bot.description ? ` ${bot.description}` : ''}${bot.is_primary ? ` You are ${firstName}'s primary Bot and main point of contact.` : ''}
 You are the same ${bot.name} they text with: the same memory, the same computer, the same connected apps. This call is just another way to talk to you.
 
 # How to get things done
@@ -223,8 +246,12 @@ ${recent || '(no messages yet)'}`;
 
 // ---------- calls ----------
 
-interface ActiveCall { id: string; botId: string; userId: string; startedAt: number; startSeq: number; tasks: string[] }
+interface ActiveCall {
+  id: string; botId: string; userId: string; startedAt: number; startSeq: number; tasks: string[];
+  provider: VoiceProvider; spekoSessionId?: string; spekoToken?: string;
+}
 const calls = new Map<string, ActiveCall>();
+const callsByToken = new Map<string, string>();
 
 function callEvent(text: string, call: VoiceCallRecord): EventBody {
   return { type: 'event', event: 'voice-call', text, ref: call.id, call };
@@ -235,62 +262,128 @@ const fmtDuration = (ms: number) => {
   return s < 60 ? `${s}s` : `${Math.floor(s / 60)}m ${String(s % 60).padStart(2, '0')}s`;
 };
 
-voiceApi.get('/options', async (c) => c.json({ voices: await listVoices(), languages: LANGUAGES, speeds: SPEEDS }));
+voiceApi.get('/options', async (c) => c.json({
+  voices: await listAllVoices(), languages: LANGUAGES, speeds: SPEEDS,
+  providers: availableProviders().map((p) => ({ id: p, name: PROVIDER_LABEL[p] })),
+  defaultVoice: env.defaultVoice,
+}));
 
-voiceApi.post('/session', async (c) => {
-  const user = c.get('user');
-  const { botId } = await c.req.json<{ botId: string }>().catch(() => ({ botId: '' }));
-  const bot = ownBot(user.id, botId);
-  if (!bot) return c.json({ error: 'not found' }, 404);
-  const s = settingsOf(bot);
-
-  const r = await fetch(`${XAI}/realtime/client_secrets`, {
-    method: 'POST',
-    headers: { ...xaiHeaders(), 'Content-Type': 'application/json' },
-    body: JSON.stringify({ expires_after: { seconds: 300 } }),
-    signal: AbortSignal.timeout(15_000),
-  }).catch((e) => ({ ok: false, status: 0, text: async () => String(e?.message ?? e) }) as any);
-  if (!r.ok) {
-    const detail = await r.text().catch(() => '');
-    console.warn('[voice] client secret mint failed', r.status, detail.slice(0, 300));
-    return c.json({ error: 'Could not start a voice session' }, 502);
+/** Realtime session config for the WebSocket providers (xAI and OpenAI share the event protocol). */
+function realtimeSession(provider: 'xai' | 'openai', voice: string, instructions: string, speed: number, language: string) {
+  if (provider === 'openai') {
+    return {
+      type: 'realtime',
+      instructions,
+      tools: VOICE_TOOLS,
+      tool_choice: 'auto',
+      audio: {
+        input: {
+          format: { type: 'audio/pcm', rate: SAMPLE_RATE },
+          transcription: { model: process.env.OPENAI_TRANSCRIBE_MODEL ?? 'gpt-4o-mini-transcribe', ...(language !== 'auto' ? { language: language.slice(0, 2) } : {}) },
+          turn_detection: { type: 'server_vad' },
+        },
+        output: { format: { type: 'audio/pcm', rate: SAMPLE_RATE }, voice, speed },
+      },
+    };
   }
-  const secret = (await r.json()) as { value: string; expires_at: number };
-
-  const instructions = voiceInstructions(user.id, bot, s.language);
-  const session: Record<string, unknown> = {
-    voice: s.voice,
+  return {
+    voice,
     instructions,
     turn_detection: { type: 'server_vad' },
     tools: VOICE_TOOLS,
     audio: {
       input: {
         format: { type: 'audio/pcm', rate: SAMPLE_RATE },
-        transcription: { model: 'grok-transcribe', ...(s.language !== 'auto' ? { language_hint: s.language } : {}) },
+        transcription: { model: 'grok-transcribe', ...(language !== 'auto' ? { language_hint: language } : {}) },
       },
-      output: { format: { type: 'audio/pcm', rate: SAMPLE_RATE }, speed: s.speed },
+      output: { format: { type: 'audio/pcm', rate: SAMPLE_RATE }, speed },
     },
   };
+}
 
-  const callId = newId('call');
-  const startRow = appendRow(bot.id, 'event', callEvent(`Voice call with ${bot.name} started`, { id: callId, phase: 'started' }));
-  calls.set(callId, { id: callId, botId: bot.id, userId: user.id, startedAt: now(), startSeq: startRow.seq, tasks: [] });
-  emitBot(bot.id);
+/**
+ * Start (or, with replaceCallId, re-point) a voice call. Tries the bot's chosen voice provider first and falls back
+ * through VOICE_PROVIDERS. `exclude` lets the browser skip a provider whose connection just failed.
+ */
+voiceApi.post('/session', async (c) => {
+  const user = c.get('user');
+  const { botId, exclude, replaceCallId } = await c.req.json<{ botId: string; exclude?: string[]; replaceCallId?: string }>().catch(() => ({ botId: '' } as any));
+  const bot = ownBot(user.id, botId);
+  if (!bot) return c.json({ error: 'not found' }, 404);
+  const s = settingsOf(bot);
+  const order = providerOrder(s.provider, Array.isArray(exclude) ? exclude : []);
+  if (!order.length) return c.json({ error: 'No voice provider is set up' }, 503);
 
-  return c.json({
-    callId,
-    clientSecret: secret.value,
-    expiresAt: secret.expires_at,
-    model: VOICE_MODEL,
-    websocketUrl: `wss://api.x.ai/v1/realtime?model=${encodeURIComponent(VOICE_MODEL)}`,
-    sampleRate: SAMPLE_RATE,
-    instructions,
-    voice: s.voice,
-    speed: s.speed,
-    language: s.language,
-    tools: VOICE_TOOLS,
-    session,
-  });
+  const instructions = voiceInstructions(user.id, bot, s.language);
+  const firstName = String((db.prepare('SELECT name FROM users WHERE id=?').get(user.id) as any)?.name ?? '').split(/\s+/)[0];
+  const prior = replaceCallId ? calls.get(replaceCallId) : undefined;
+  const callId = prior && prior.botId === bot.id ? prior.id : newId('call');
+  const errors: string[] = [];
+
+  for (const provider of order) {
+    const voice = fallbackVoice(provider, { provider: s.provider, id: s.voice });
+    try {
+      let payload: Record<string, unknown>;
+      let extra: Partial<ActiveCall> = {};
+      if (provider === 'speko') {
+        const agentId = await ensureSpekoAgent(VOICE_TOOLS.filter((t) => t.name !== 'end_the_call') as any);
+        const callToken = crypto.randomBytes(24).toString('base64url');
+        const ses = await mintSpekoSession({
+          agentId, instructions, voice, speed: s.speed, language: s.language, callToken,
+          firstMessage: firstName ? `Hey ${firstName}, it's ${bot.name}. What's up?` : `Hi, it's ${bot.name}. What can I do for you?`,
+        });
+        extra = { spekoSessionId: ses.sessionId, spekoToken: callToken };
+        payload = { transportToken: ses.transportToken, transportUrl: ses.transportUrl, transport: ses.transport, spekoSessionId: ses.sessionId };
+      } else if (provider === 'openai') {
+        const session = realtimeSession('openai', voice, instructions, s.speed, s.language);
+        const secret = await mintOpenAISession(session);
+        const { type: _t, ...update } = session as any;
+        payload = {
+          clientSecret: secret.value, expiresAt: secret.expiresAt, model: env.openaiVoiceModel,
+          websocketUrl: `wss://api.openai.com/v1/realtime?model=${encodeURIComponent(env.openaiVoiceModel)}`,
+          protocols: ['realtime', `openai-insecure-api-key.${secret.value}`],
+          session: { type: 'realtime', ...update },
+        };
+      } else {
+        const r = await fetch(`${XAI}/realtime/client_secrets`, {
+          method: 'POST',
+          headers: { ...xaiHeaders(), 'Content-Type': 'application/json' },
+          body: JSON.stringify({ expires_after: { seconds: 300 } }),
+          signal: AbortSignal.timeout(15_000),
+        });
+        if (!r.ok) throw new Error(`xAI client secret ${r.status}: ${(await r.text().catch(() => '')).slice(0, 200)}`);
+        const secret = (await r.json()) as { value: string; expires_at: number };
+        payload = {
+          clientSecret: secret.value, expiresAt: secret.expires_at, model: VOICE_MODEL,
+          websocketUrl: `wss://api.x.ai/v1/realtime?model=${encodeURIComponent(VOICE_MODEL)}`,
+          protocols: [`xai-client-secret.${secret.value}`],
+          session: realtimeSession('xai', voice, instructions, s.speed, s.language),
+        };
+      }
+
+      if (prior && prior.botId === bot.id) {
+        if (prior.spekoToken) callsByToken.delete(prior.spekoToken);
+        if (prior.spekoSessionId && prior.spekoSessionId !== extra.spekoSessionId) void endSpekoSession(prior.spekoSessionId);
+        Object.assign(prior, { provider, spekoSessionId: undefined, spekoToken: undefined, ...extra });
+      } else {
+        const startRow = appendRow(bot.id, 'event', callEvent(`Voice call with ${bot.name} started`, { id: callId, phase: 'started' }));
+        calls.set(callId, { id: callId, botId: bot.id, userId: user.id, startedAt: now(), startSeq: startRow.seq, tasks: [], provider, ...extra });
+        emitBot(bot.id);
+      }
+      if (extra.spekoToken) callsByToken.set(extra.spekoToken, callId);
+      if (provider !== s.provider || errors.length) console.log(`[voice] call ${callId} using ${provider}${errors.length ? ` after: ${errors.join(' | ')}` : ''}`);
+
+      return c.json({
+        callId, provider, providerName: PROVIDER_LABEL[provider], fallbackFrom: provider !== s.provider ? s.provider : undefined,
+        sampleRate: SAMPLE_RATE, instructions, voice, speed: s.speed, language: s.language, tools: VOICE_TOOLS,
+        ...payload,
+      });
+    } catch (e: any) {
+      errors.push(`${provider}: ${String(e?.message ?? e).slice(0, 200)}`);
+      console.warn('[voice] session failed on', provider, e?.message ?? e);
+    }
+  }
+  return c.json({ error: 'Could not start a voice session', details: errors }, 502);
 });
 
 voiceApi.post('/tool', async (c) => {
@@ -298,13 +391,19 @@ voiceApi.post('/tool', async (c) => {
   const { botId, callId, name, args } = await c.req.json<{ botId: string; callId?: string; name: string; args?: any }>();
   const bot = ownBot(user.id, botId);
   if (!bot) return c.json({ error: 'not found' }, 404);
+  return c.json(runTool(user, bot, callId, name, args));
+});
+
+/** The relay tools, shared by the browser path (xAI/OpenAI) and Speko's webhook tools. */
+function runTool(user: { id: string }, bot: any, callId: string | undefined, name: string, args: any): { output: string; taskSeq?: number } {
   const a = args && typeof args === 'object' ? args : {};
   const call = callId ? calls.get(callId) : undefined;
+  const json = (o: { output: string; taskSeq?: number }) => o;
 
   switch (name) {
     case 'send_task': {
       const request = String(a.request ?? '').trim();
-      if (!request) return c.json({ output: 'Error: request is empty. Ask the user what they want done.' });
+      if (!request) return json({ output: 'Error: request is empty. Ask the user what they want done.' });
       const from: MessageBody['from'] = { kind: 'voice', id: callId ?? 'call', name: 'Voice call' };
       const row = appendRow(bot.id, 'message', { type: 'message', role: 'user', text: request, from });
       enqueue(bot.id, {
@@ -312,16 +411,16 @@ voiceApi.post('/tool', async (c) => {
         text: `[Voice call: ${String((db.prepare('SELECT name FROM users WHERE id=?').get(user.id) as any)?.name ?? 'the user').split(/\s+/)[0]} asked for this on a live voice call with you. Do the work, then reply in plain, short text with the outcome. Your reply is read aloud on the call, so lead with the answer and skip markdown, links and IDs unless asked.]\n${request}`,
       });
       call?.tasks.push(clip(request, 200));
-      return c.json({ output: 'Handed off. You are working on it now; the result will arrive as a [work_landed] note. Tell the user briefly that you are on it (unless you already did), then wait.', taskSeq: row.seq });
+      return json({ output: 'Handed off. You are working on it now; the result will arrive as a [work_landed] note. Tell the user briefly that you are on it (unless you already did), then wait.', taskSeq: row.seq });
     }
     case 'recall_text_messages': {
       const count = Math.min(30, Math.max(1, Number(a.count) || 10));
       const msgs = recentMessages(bot.id, count);
-      return c.json({ output: msgs.length ? msgs.map((m) => `[${ago(m.at)}] ${m.who}: ${clip(m.text, 800)}`).join('\n') : 'No messages yet.' });
+      return json({ output: msgs.length ? msgs.map((m) => `[${ago(m.at)}] ${m.who}: ${clip(m.text, 800)}`).join('\n') : 'No messages yet.' });
     }
     case 'search_conversations': {
       const q = String(a.query ?? '').trim();
-      if (!q) return c.json({ output: 'Error: query is empty.' });
+      if (!q) return json({ output: 'Error: query is empty.' });
       const scope = ['this_chat', 'earlier', 'everything'].includes(a.scope) ? a.scope : 'this_chat';
       const like = `%${q.replace(/[%_]/g, (m) => `\\${m}`)}%`;
       const rows = (scope === 'everything'
@@ -346,32 +445,50 @@ voiceApi.post('/tool', async (c) => {
         hits.push(`[${ago(r.created_at)}${scope === 'everything' ? `, chat with ${r.bot_name}` : ''}] ${who}: …${snippet}…`);
         if (hits.length >= 8) break;
       }
-      return c.json({ output: hits.length ? hits.join('\n') : `No matches for "${q}".` });
+      return json({ output: hits.length ? hits.join('\n') : `No matches for "${q}".` });
     }
     case 'peek_activity':
-      return c.json({ output: activitySnapshot(bot.id) });
+      return json({ output: activitySnapshot(bot.id) });
     case 'end_the_call':
-      return c.json({ output: 'Hanging up after your goodbye.' });
+      return json({ output: 'Hanging up after your goodbye.' });
     default:
-      return c.json({ output: `Unknown tool ${name}.` });
+      return json({ output: `Unknown tool ${name}.` });
   }
-});
+}
 
-const xai = new OpenAI({ apiKey: env.xaiKey, baseURL: XAI, timeout: 45_000 });
+/**
+ * Speko webhook tools land here (no browser cookie: authenticated by the per-call token Speko holds as a
+ * session toolSecret, plus the Standard-Webhooks signature when Speko sends one).
+ */
+export const spekoHooks = new Hono();
+spekoHooks.post('/tool', async (c) => {
+  const raw = await c.req.text();
+  const sig = verifySpekoSignature(c.req.raw.headers, raw);
+  if (sig === false) console.warn('[voice] Speko tool call with a signature that did not verify');
+  const token = c.req.header('x-birdbot-call') ?? '';
+  const callId = token ? callsByToken.get(token) : undefined;
+  const call = callId ? calls.get(callId) : undefined;
+  if (!call || sig === false) return c.json({ error: 'unknown call' }, 401);
+  let body: any = {};
+  try { body = JSON.parse(raw); } catch { /* empty */ }
+  const name = String(body.tool ?? body.name ?? '');
+  const args = body.args ?? body.arguments ?? {};
+  const bot = getBotRow(call.botId);
+  if (!bot) return c.json({ error: 'bot gone' }, 404);
+  const out = runTool({ id: call.userId }, bot, call.id, name, typeof args === 'string' ? safeJson(args) : args);
+  return c.json({ result: out.output });
+});
+const safeJson = (s: string) => { try { return JSON.parse(s); } catch { return {}; } };
+
+const xai = new OpenAI({ apiKey: env.xaiKey || 'unset', baseURL: XAI, timeout: 45_000 });
 
 async function summarizeCall(botName: string, transcript: { role: string; text: string }[], tasks: string[]): Promise<string | null> {
   if (!transcript.length && !tasks.length) return null;
   const lines = transcript.map((t) => `${t.role === 'user' ? 'User' : botName}: ${t.text}`).join('\n').slice(-12_000);
-  const res: any = await xai.responses.create({
-    model: env.xaiModel,
-    reasoning: { effort: 'low' },
-    store: false,
-    input: [
-      { role: 'system', content: `Summarise this voice call between the user and ${botName} in one short sentence (max 25 words), past tense, third person ("Talked about…", "Asked ${botName} to…"). No preamble.` },
-      { role: 'user', content: `${lines || '(no transcript)'}${tasks.length ? `\n\nWork handed off during the call:\n${tasks.map((t) => `- ${t}`).join('\n')}` : ''}` },
-    ],
-  } as any);
-  const text = String(res.output_text ?? '').trim();
+  const text = (await quickText(
+    `Summarise this voice call between the user and ${botName} in one short sentence (max 25 words), past tense, third person ("Talked about…", "Asked ${botName} to…"). No preamble.`,
+    `${lines || '(no transcript)'}${tasks.length ? `\n\nWork handed off during the call:\n${tasks.map((t) => `- ${t}`).join('\n')}` : ''}`,
+  )).trim();
   return text ? clip(text.replace(/\s+/g, ' '), 240) : null;
 }
 
@@ -383,6 +500,8 @@ voiceApi.post('/end', async (c) => {
   const call = calls.get(callId);
   if (!call || call.botId !== bot.id) return c.json({ ok: true, duplicate: true });
   calls.delete(callId);
+  if (call.spekoToken) callsByToken.delete(call.spekoToken);
+  if (call.spekoSessionId) void endSpekoSession(call.spekoSessionId);
 
   const durationMs = now() - call.startedAt;
   const lines = (Array.isArray(transcript) ? transcript : [])
@@ -406,6 +525,7 @@ setInterval(() => {
   for (const call of calls.values()) {
     if (now() - call.startedAt < 2 * 3600_000) continue;
     calls.delete(call.id);
+    if (call.spekoToken) callsByToken.delete(call.spekoToken);
     appendRow(call.botId, 'event', callEvent('Voice call ended', { id: call.id, phase: 'ended', tasks: call.tasks }));
   }
 }, 10 * 60_000).unref();
@@ -416,25 +536,42 @@ voiceApi.post('/preview', async (c) => {
   const user = c.get('user');
   const p = await c.req.json<{ botId?: string; voice?: string; speed?: number; language?: string; text?: string; codec?: 'mp3' | 'pcm' }>().catch(() => ({} as any));
   const bot = ownBot(user.id, p.botId);
-  const s = bot ? settingsOf(bot) : { voice: 'luna', speed: 1, language: 'auto' };
-  const voice = String(p.voice || s.voice).slice(0, 80);
+  const s = bot ? settingsOf(bot) : { ...parseVoice(''), speed: 1, language: 'auto' } as any;
+  const chosen = parseVoice(p.voice || (bot ? s.voiceKey : ''));
   const language = p.language && langName(p.language) ? p.language : s.language;
+  const speed = clampSpeed(p.speed ?? s.speed);
   const text = String(p.text || `Hi, I'm ${bot?.name ?? 'your Bot'}. This is how I'll sound when we talk.`).slice(0, 400);
-  const codec = p.codec === 'pcm' ? 'pcm' : 'mp3';
-  const r = await fetch(`${XAI}/tts`, {
-    method: 'POST',
-    headers: { ...xaiHeaders(), 'Content-Type': 'application/json' },
-    body: JSON.stringify({ text, voice_id: voice, language, speed: clampSpeed(p.speed ?? s.speed), output_format: { codec, sample_rate: SAMPLE_RATE } }),
-    signal: AbortSignal.timeout(30_000),
-  }).catch(() => null);
-  if (!r?.ok) {
-    console.warn('[voice] tts failed', r?.status, (await r?.text().catch(() => ''))?.slice(0, 200));
+
+  try {
+    if (chosen.provider === 'speko') {
+      const r = await speko().synthesize(text, { language: spekoLanguage(language), voice: chosen.id, speed } as any);
+      return c.body(Buffer.from(r.audio), 200, { 'Content-Type': r.contentType || 'audio/mpeg', 'Cache-Control': 'no-store' });
+    }
+    if (chosen.provider === 'openai') {
+      const r = await fetch('https://api.openai.com/v1/audio/speech', {
+        method: 'POST', headers: { Authorization: `Bearer ${env.openaiKey}`, 'Content-Type': 'application/json' },
+        body: JSON.stringify({ model: process.env.OPENAI_TTS_MODEL ?? 'gpt-4o-mini-tts', voice: chosen.id, input: text, response_format: 'pcm', speed }),
+        signal: AbortSignal.timeout(30_000),
+      });
+      if (!r.ok) throw new Error(`OpenAI TTS ${r.status}`);
+      return c.body(Buffer.from(await r.arrayBuffer()), 200, { 'Content-Type': `audio/pcm;rate=${SAMPLE_RATE}`, 'Cache-Control': 'no-store' });
+    }
+    const codec = p.codec === 'pcm' ? 'pcm' : 'mp3';
+    const r = await fetch(`${XAI}/tts`, {
+      method: 'POST',
+      headers: { ...xaiHeaders(), 'Content-Type': 'application/json' },
+      body: JSON.stringify({ text, voice_id: chosen.id, language, speed, output_format: { codec, sample_rate: SAMPLE_RATE } }),
+      signal: AbortSignal.timeout(30_000),
+    });
+    if (!r.ok) throw new Error(`xAI TTS ${r.status}`);
+    return c.body(Buffer.from(await r.arrayBuffer()), 200, {
+      'Content-Type': codec === 'pcm' ? `audio/pcm;rate=${SAMPLE_RATE}` : 'audio/mpeg',
+      'Cache-Control': 'no-store',
+    });
+  } catch (e: any) {
+    console.warn('[voice] preview failed', chosen.provider, e?.message ?? e);
     return c.json({ error: 'Preview unavailable' }, 502);
   }
-  return c.body(Buffer.from(await r.arrayBuffer()), 200, {
-    'Content-Type': codec === 'pcm' ? `audio/pcm;rate=${SAMPLE_RATE}` : 'audio/mpeg',
-    'Cache-Control': 'no-store',
-  });
 });
 
 voiceApi.post('/stt', async (c) => {
@@ -443,16 +580,33 @@ voiceApi.post('/stt', async (c) => {
   if (!file || typeof file === 'string') return c.json({ error: 'file required' }, 400);
   if (file.size > 25 * 1024 * 1024) return c.json({ error: 'recording too long' }, 413);
   if (file.size < 200) return c.json({ text: '' });
-  const out = new FormData();
-  out.append('model', STT_MODEL);
   const lang = String(form?.get('language') ?? '');
-  if (lang && lang !== 'auto' && /^[a-z]{2}$/.test(lang)) out.append('language', lang);
-  out.append('file', file, file.name || 'dictation.webm'); // must be last
-  const r = await fetch(`${XAI}/stt`, { method: 'POST', headers: xaiHeaders(), body: out, signal: AbortSignal.timeout(60_000) }).catch(() => null);
-  if (!r?.ok) {
-    console.warn('[voice] stt failed', r?.status, (await r?.text().catch(() => ''))?.slice(0, 200));
-    return c.json({ error: 'Transcription failed' }, 502);
+  const short = lang && lang !== 'auto' && /^[a-z]{2}/.test(lang) ? lang.slice(0, 2) : '';
+
+  // Speko first, then OpenAI, then xAI — whichever is set up.
+  if (env.spekoKey) {
+    try {
+      const r: any = await speko().transcribe(Buffer.from(await file.arrayBuffer()), { language: spekoLanguage(lang || 'en'), contentType: file.type || 'audio/webm' } as any);
+      if (typeof r?.text === 'string') return c.json({ text: r.text.trim() });
+    } catch (e: any) { console.warn('[voice] Speko stt failed:', e?.message); }
   }
-  const j = (await r.json()) as { text?: string };
-  return c.json({ text: (j.text ?? '').trim() });
+  if (env.openaiKey) {
+    const out = new FormData();
+    out.append('model', process.env.OPENAI_TRANSCRIBE_MODEL ?? 'gpt-4o-mini-transcribe');
+    if (short) out.append('language', short);
+    out.append('file', file, file.name || 'dictation.webm');
+    const r = await fetch('https://api.openai.com/v1/audio/transcriptions', { method: 'POST', headers: { Authorization: `Bearer ${env.openaiKey}` }, body: out, signal: AbortSignal.timeout(60_000) }).catch(() => null);
+    if (r?.ok) return c.json({ text: String(((await r.json()) as any).text ?? '').trim() });
+    console.warn('[voice] OpenAI stt failed', r?.status);
+  }
+  if (env.xaiKey) {
+    const out = new FormData();
+    out.append('model', STT_MODEL);
+    if (short) out.append('language', short);
+    out.append('file', file, file.name || 'dictation.webm'); // must be last
+    const r = await fetch(`${XAI}/stt`, { method: 'POST', headers: xaiHeaders(), body: out, signal: AbortSignal.timeout(60_000) }).catch(() => null);
+    if (r?.ok) return c.json({ text: String(((await r.json()) as any).text ?? '').trim() });
+    console.warn('[voice] xAI stt failed', r?.status);
+  }
+  return c.json({ error: 'Transcription failed' }, 502);
 });

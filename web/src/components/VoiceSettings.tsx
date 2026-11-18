@@ -6,7 +6,7 @@ import { endCall, isCallActive, previewVoice, startCall, useVoice } from '../voi
 import { Icon } from './Icon';
 
 const FALLBACK: VoiceOptions = {
-  voices: ['ara', 'eve', 'leo', 'luna', 'rex', 'sal'].map((id) => ({ id, name: id[0].toUpperCase() + id.slice(1) })),
+  voices: [{ id: 'speko:a5136bf9-224c-4d76-b823-52bd5efcffcc', name: 'Jameson (American male) · Cartesia', provider: 'speko' }],
   languages: [{ code: 'auto', name: 'Auto-detect' }, { code: 'en', name: 'English' }],
   speeds: [0.7, 0.85, 1, 1.15, 1.3, 1.5],
 };

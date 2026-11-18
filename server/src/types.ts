@@ -24,7 +24,7 @@ export interface Bot {
   kind?: 'agent' | 'room';
   pinned: boolean;
   effort: 'low' | 'medium' | 'high' | 'xhigh';
-  /** Voice chat settings: xAI voice id, speed multiplier (0.7–1.5), BCP-47 language or 'auto'. */
+  /** Voice chat settings: provider:voiceId (speko:…, openai:…, xai:…), speed multiplier (0.7–1.5), BCP-47 language or 'auto'. */
   voice: string;
   voiceSpeed: number;
   voiceLanguage: string;
@@ -141,7 +141,7 @@ export interface VoiceCallRecord {
   tasks?: string[];
 }
 
-export interface VoiceOption { id: string; name: string; gender?: string }
+export interface VoiceOption { id: string; name: string; gender?: string; provider?: 'speko' | 'openai' | 'xai' }
 
 export interface NoticeBody { type: 'notice'; text: string; tone?: 'info' | 'warn' | 'error' }
 

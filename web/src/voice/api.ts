@@ -1,11 +1,24 @@
 import type { VoiceOption } from '@shared/types';
 
+export type VoiceProviderId = 'speko' | 'openai' | 'xai';
+
 export interface VoiceSession {
   callId: string;
-  clientSecret: string;
-  expiresAt: number;
-  model: string;
-  websocketUrl: string;
+  provider: VoiceProviderId;
+  providerName: string;
+  /** Set when the bot's own voice provider was unavailable and this one stepped in. */
+  fallbackFrom?: VoiceProviderId;
+  // WebSocket realtime providers (OpenAI, xAI)
+  clientSecret?: string;
+  expiresAt?: number;
+  model?: string;
+  websocketUrl?: string;
+  protocols?: string[];
+  // Speko (WebRTC via @spekoai/client)
+  transportToken?: string;
+  transportUrl?: string;
+  transport?: 'livekit' | 'daily';
+  spekoSessionId?: string;
   sampleRate: number;
   instructions: string;
   voice: string;
@@ -15,7 +28,7 @@ export interface VoiceSession {
   session: Record<string, unknown>;
 }
 
-export interface VoiceOptions { voices: VoiceOption[]; languages: { code: string; name: string }[]; speeds: number[] }
+export interface VoiceOptions { voices: VoiceOption[]; languages: { code: string; name: string }[]; speeds: number[]; providers?: { id: VoiceProviderId; name: string }[]; defaultVoice?: string }
 
 async function post<T>(path: string, body: unknown): Promise<T> {
   const res = await fetch(`/api/voice${path}`, { method: 'POST', credentials: 'include', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
@@ -34,7 +47,7 @@ export const voiceApi = {
     if (!r.ok) throw new Error(`HTTP ${r.status}`);
     return r.json() as Promise<VoiceOptions>;
   }).catch((e) => { optionsPromise = null; throw e; })),
-  session: (botId: string) => post<VoiceSession>('/session', { botId }),
+  session: (botId: string, opts: { exclude?: string[]; replaceCallId?: string } = {}) => post<VoiceSession>('/session', { botId, ...opts }),
   tool: (botId: string, callId: string, name: string, args: unknown) => post<{ output: string; taskSeq?: number }>('/tool', { botId, callId, name, args }),
   end: (botId: string, callId: string, transcript: { role: 'user' | 'assistant'; text: string }[], error?: string) => post<{ ok: true }>('/end', { botId, callId, transcript, error }),
   /** Best-effort end on tab close. */
@@ -44,8 +57,18 @@ export const voiceApi = {
   async preview(p: { botId: string; voice?: string; speed?: number; language?: string; text?: string }): Promise<Int16Array> {
     const res = await fetch('/api/voice/preview', { method: 'POST', credentials: 'include', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ ...p, codec: 'pcm' }) });
     if (!res.ok) throw new Error('Preview unavailable');
+    const type = res.headers.get('Content-Type') ?? '';
     const buf = await res.arrayBuffer();
-    return new Int16Array(buf, 0, buf.byteLength >> 1);
+    if (type.startsWith('audio/pcm')) return new Int16Array(buf, 0, buf.byteLength >> 1);
+    // Speko returns an encoded file (mp3/wav/ogg): decode it and convert to 24 kHz PCM16 for the shared player.
+    const ctx = new OfflineAudioContext(1, 1, 24000);
+    const audio = await ctx.decodeAudioData(buf.slice(0));
+    const off = new OfflineAudioContext(1, Math.ceil(audio.duration * 24000), 24000);
+    const src = off.createBufferSource(); src.buffer = audio; src.connect(off.destination); src.start();
+    const f32 = (await off.startRendering()).getChannelData(0);
+    const out = new Int16Array(f32.length);
+    for (let i = 0; i < f32.length; i++) out[i] = Math.max(-32768, Math.min(32767, Math.round(f32[i] * 32767)));
+    return out;
   },
   async transcribe(blob: Blob, language?: string): Promise<string> {
     const fd = new FormData();

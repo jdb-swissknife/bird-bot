@@ -5,7 +5,8 @@
 #     bash install-on-computer.sh /path/to/hq-app.tgz
 #
 # Optional: PORT (8787), PRIMARY_CDP_URL (DevTools URL of the main agent's own Chrome, if it has one),
-# DEV_LOGIN=1 (test machines only), KEYS_FILE (lines XAI_API_KEY=, COMPOSIO_API_KEY=, ORGO_API_KEY=).
+# DEV_LOGIN=1 (test machines only), KEYS_FILE (lines COMPOSIO_API_KEY=, ORGO_API_KEY=, OPENAI_API_KEY=, and optionally
+# XAI_API_KEY= / SPEKO_API_KEY=; SPEKO_API_KEY falls back to the one in Hermes' .env).
 # ORGO_API_KEY may be left out of KEYS_FILE when Hermes' own .env already has one.
 #
 # It never restarts Hermes and never touches its config: adding the app's tools to the main agent is a
@@ -56,6 +57,11 @@ if [ ! -f "$APP/.env" ]; then
     echo "ORGO_API_KEY=$orgo"
     echo "XAI_API_KEY=$(key XAI_API_KEY "$K")"
     echo "COMPOSIO_API_KEY=$(key COMPOSIO_API_KEY "$K")"
+    echo "OPENAI_API_KEY=$(key OPENAI_API_KEY "$K")"
+    # Speko (primary voice): from KEYS_FILE, else the key Hermes already has.
+    sk="$(key SPEKO_API_KEY "$K")"; [ -n "$sk" ] || sk="$(key SPEKO_API_KEY "$HERMES_HOME_DIR/.env")"
+    echo "SPEKO_API_KEY=$sk"
+    echo "TZ=${TZ:-America/Chicago}"
     xm="$(key XAI_MODEL "$K")"; [ -z "$xm" ] || echo "XAI_MODEL=$xm"
     [ -z "${PRIMARY_BOT_NAME:-}" ] || echo "PRIMARY_BOT_NAME=$PRIMARY_BOT_NAME"
     [ -z "${PRIMARY_BOT_LABEL:-}" ] || echo "PRIMARY_BOT_LABEL=$PRIMARY_BOT_LABEL"

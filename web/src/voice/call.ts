@@ -1,6 +1,10 @@
-// The in-browser voice agent. Grok Bot runs calls as a second, lightweight agent against the xAI realtime
-// API that speaks as the bot and relays real work to the bot's main text agent (send_task). Results come
-// back through the normal transcript stream and are injected into the call as [work_landed] notes.
+// The in-browser voice agent. A second, lightweight voice agent speaks as the bot and relays real work to the
+// bot's main text agent (send_task). Results come back through the normal transcript stream and are injected
+// into the call as [work_landed] notes.
+//
+// Providers: Speko (primary — a hosted Speko voice agent over WebRTC; its relay tools are server-side webhooks),
+// with OpenAI realtime and xAI realtime (WebSocket, handled here) as backups. If a provider fails to connect,
+// the call falls back to the next one without the user doing anything.
 import { create } from 'zustand';
 import type { Row } from '@shared/types';
 import { sortedRows, useStore } from '../store';
@@ -27,11 +31,13 @@ interface VoiceState {
   captions: Caption[];
   error: string | null;
   startedAt: number | null;
+  /** Which voice service carries the call ("Speko", "OpenAI", "xAI"). */
+  providerName: string | null;
 }
 
 export const useVoice = create<VoiceState>(() => ({
   status: 'idle', botId: null, callId: null, muted: false, speaking: false, listening: false, thinking: false,
-  working: [], captions: [], error: null, startedAt: null,
+  working: [], captions: [], error: null, startedAt: null, providerName: null,
 }));
 
 const setV = (p: Partial<VoiceState>) => useVoice.setState(p);
@@ -51,7 +57,7 @@ export function startCall(botId: string) {
 export function endCall() { current?.end(); }
 export function toggleMute() { current?.setMuted(!useVoice.getState().muted); }
 export function callLevels(): { out: number; mic: number } {
-  return current && !current.ended ? { out: current.player.level(), mic: current.micLevel() } : { out: 0, mic: 0 };
+  return current && !current.ended ? { out: current.outLevel(), mic: current.micLevel() } : { out: 0, mic: 0 };
 }
 export const isCallActive = (s: VoiceState = useVoice.getState()) => s.status === 'connecting' || s.status === 'live';
 
@@ -82,6 +88,11 @@ class VoiceCall {
   private checkTimer: ReturnType<typeof setTimeout> | null = null;
   private connectTimer: ReturnType<typeof setTimeout> | null = null;
   private onUnload = () => { if (this.sess && !this.ended) voiceApi.endBeacon(this.botId, this.sess.callId, this.transcript()); };
+  /** Speko conversation (WebRTC) when the call runs on Speko. */
+  private conv: any = null;
+  private spekoMode: 'listening' | 'speaking' = 'listening';
+  private seenTaskSeqs = new Set<number>();
+  private tried: string[] = [];
 
   constructor(readonly botId: string) {
     // Created synchronously inside the click so autoplay policy lets it run.
@@ -93,8 +104,13 @@ class VoiceCall {
 
   micLevel() { return useVoice.getState().muted ? 0 : this.mic?.level ?? 0; }
 
+  outLevel() {
+    if (this.sess?.provider !== 'speko') return this.player.level();
+    return this.spekoMode === 'speaking' ? 0.25 + 0.2 * Math.abs(Math.sin(Date.now() / 140)) : 0;
+  }
+
   async start() {
-    setV({ status: 'connecting', botId: this.botId, callId: null, muted: false, speaking: false, listening: false, thinking: false, working: [], captions: [], error: null, startedAt: null });
+    setV({ status: 'connecting', botId: this.botId, callId: null, muted: false, speaking: false, listening: false, thinking: false, working: [], captions: [], error: null, startedAt: null, providerName: null });
     window.addEventListener('pagehide', this.onUnload);
     let stream: MediaStream;
     try {
@@ -107,27 +123,96 @@ class VoiceCall {
     try {
       this.mic = new MicCapture(this.ctx, stream, (pcm) => this.sendAudio(pcm));
       await this.mic.start();
-      this.sess = await voiceApi.session(this.botId);
-      if (this.ended) { void voiceApi.end(this.botId, this.sess.callId, [], 'Cancelled'); return; }
-      setV({ callId: this.sess.callId });
-      this.connect(this.sess);
+      await this.open();
     } catch (e) {
       this.end((e as Error).message || 'Could not start the call');
     }
   }
 
+  /** Get a session (first, or the next provider after a failure) and connect it. */
+  private async open() {
+    const sess = await voiceApi.session(this.botId, { exclude: this.tried, replaceCallId: this.sess?.callId });
+    if (this.ended) { void voiceApi.end(this.botId, sess.callId, [], 'Cancelled'); return; }
+    this.sess = sess;
+    this.tried.push(sess.provider);
+    setV({ callId: sess.callId, providerName: sess.providerName });
+    if (sess.provider === 'speko') await this.connectSpeko(sess);
+    else this.connect(sess);
+  }
+
+  /** A provider failed before the call went live: try the next one, or give up. */
+  private fallback(reason: string) {
+    if (this.ended || this.ready) return;
+    console.warn(`[voice] ${this.sess?.provider} failed (${reason}); trying the next provider`);
+    if (this.connectTimer) clearTimeout(this.connectTimer);
+    try { this.ws?.close(); } catch { /* ignore */ }
+    this.ws = null;
+    void this.conv?.endSession?.().catch(() => {});
+    this.conv = null;
+    if (this.tried.length >= 3) { this.end(reason); return; }
+    this.open().catch((e) => this.end((e as Error).message || reason));
+  }
+
+  // ---------- Speko (WebRTC) ----------
+
+  private async connectSpeko(sess: VoiceSession) {
+    this.connectTimer = setTimeout(() => { if (!this.ready) this.fallback('Speko didn’t connect'); }, 20000);
+    try {
+      const { VoiceConversation } = await import('@spekoai/client');
+      const conv: any = await VoiceConversation.create({
+        transportToken: sess.transportToken!,
+        transportUrl: sess.transportUrl!,
+        ...(sess.transport ? { transport: sess.transport } : {}),
+        onConnect: () => {
+          if (this.ended || this.ready) return;
+          this.ready = true;
+          if (this.connectTimer) clearTimeout(this.connectTimer);
+          setV({ status: 'live', startedAt: Date.now() });
+          this.watchTranscript();
+        },
+        onDisconnect: ({ reason, message }: { reason: string; message?: string }) => {
+          if (this.ended) return;
+          if (!this.ready) { this.fallback(message || `Speko disconnected (${reason})`); return; }
+          this.end(reason === 'agent' || reason === 'user' ? undefined : 'Call dropped');
+        },
+        onTranscript: (list: readonly { source: 'agent' | 'user'; text: string; isFinal: boolean; segmentId?: string }[]) => {
+          setV({ captions: list.map((m, i) => ({ id: m.segmentId ?? `${m.source}-${i}`, role: m.source === 'agent' ? 'assistant' : 'user', text: m.text, final: m.isFinal })).slice(-200) as Caption[] });
+        },
+        onModeChange: (mode: 'listening' | 'speaking') => {
+          this.spekoMode = mode;
+          setV({ speaking: mode === 'speaking', thinking: false, listening: false });
+          if (mode === 'listening') this.flushNotes();
+        },
+        onAudioPlaybackBlocked: () => {
+          // Autoplay blocked: resume on the next tap anywhere.
+          const resume = () => { void conv?.startAudioPlayback?.(); window.removeEventListener('pointerdown', resume); };
+          window.addEventListener('pointerdown', resume);
+        },
+        onError: (e: Error) => console.warn('[voice] speko error', e),
+      });
+      if (this.ended) { void conv.endSession().catch(() => {}); return; }
+      this.conv = conv;
+      if (useVoice.getState().muted) void conv.setMicMuted(true);
+    } catch (e) {
+      this.fallback((e as Error).message || 'Speko didn’t connect');
+    }
+  }
+
+  // ---------- WebSocket realtime (OpenAI, xAI) ----------
+
   private connect(sess: VoiceSession) {
-    const ws = new WebSocket(sess.websocketUrl, [`xai-client-secret.${sess.clientSecret}`]);
+    const ws = new WebSocket(sess.websocketUrl!, sess.protocols ?? [`xai-client-secret.${sess.clientSecret}`]);
     this.ws = ws;
-    this.connectTimer = setTimeout(() => { if (!this.ready) this.end('Couldn’t connect the call'); }, 15000);
+    this.connectTimer = setTimeout(() => { if (!this.ready) this.fallback('Couldn’t connect the call'); }, 15000);
     ws.onopen = () => this.send({ type: 'session.update', session: sess.session });
     ws.onmessage = (m) => {
       if (typeof m.data !== 'string') return;
       try { this.handle(JSON.parse(m.data)); } catch (e) { console.warn('[voice] bad event', e); }
     };
     ws.onclose = (e) => {
-      if (this.ended) return;
-      this.end(this.ready ? 'Call dropped' : `Couldn’t connect the call${e.reason ? ` (${e.reason})` : ''}`);
+      if (this.ended || this.ws !== ws) return;
+      if (!this.ready) this.fallback(`Couldn’t connect the call${e.reason ? ` (${e.reason})` : ''}`);
+      else this.end('Call dropped');
     };
   }
 
@@ -142,6 +227,7 @@ class VoiceCall {
 
   setMuted(m: boolean) {
     if (this.mic) this.mic.muted = m;
+    if (this.conv) void this.conv.setMicMuted(m).catch(() => {});
     if (m && this.ready) this.send({ type: 'input_audio_buffer.clear' });
     setV({ muted: m, listening: m ? false : useVoice.getState().listening });
   }
@@ -241,7 +327,7 @@ class VoiceCall {
         const code = ev.error?.code ?? ev.code ?? '';
         if (/cancel/i.test(String(code)) || /no active response/i.test(String(ev.error?.message ?? ''))) return;
         console.warn('[voice] realtime error', ev.error ?? ev);
-        if (!this.ready) this.end(ev.error?.message ?? 'Voice service error');
+        if (!this.ready) this.fallback(ev.error?.message ?? 'Voice service error');
         return;
       }
     }
@@ -332,6 +418,16 @@ class VoiceCall {
 
   private watchTranscript() {
     this.unsubStore = useStore.subscribe((s, prev) => {
+      // On Speko the relay tools run server-side, so a hand-off shows up here as a new voice message row.
+      if (this.sess?.provider === 'speko' && s.transcripts[this.botId] !== prev.transcripts[this.botId]) {
+        for (const r of sortedRows(s.transcripts[this.botId])) {
+          const b = r.body;
+          if (b.type === 'message' && b.role === 'user' && b.from?.kind === 'voice' && b.from.id === this.sess.callId && !this.seenTaskSeqs.has(r.seq)) {
+            this.seenTaskSeqs.add(r.seq);
+            this.addTask(r.seq, b.text);
+          }
+        }
+      }
       if (!this.tasks.length) return;
       if (s.live[this.botId] !== prev.live[this.botId] || s.transcripts[this.botId] !== prev.transcripts[this.botId]) {
         if (s.live[this.botId]?.isRunning) for (const t of this.tasks) t.sawRunning = true;
@@ -389,6 +485,12 @@ class VoiceCall {
 
   private flushNotes() {
     if (!this.ready || this.ended || !this.notes.length) return;
+    if (this.conv) {
+      if (this.spekoMode === 'speaking') return; // retried when the agent goes back to listening
+      const text = this.notes.splice(0).map((n) => `[work_landed] ${n}`).join('\n\n');
+      void this.conv.sendChatMessage(`${text}\n\n(Automatic note from your text agent, not spoken by ${this.firstName()}. Tell them the outcome now, briefly.)`).catch((e: Error) => console.warn('[voice] note failed', e));
+      return;
+    }
     if (this.responseActive || this.userSpeaking || this.inflight.size) return; // retried on response.done / speech_stopped
     if (this.player.playing) {
       if (!this.flushWaiting) {
@@ -413,6 +515,8 @@ class VoiceCall {
     if (this.checkTimer) clearTimeout(this.checkTimer);
     this.unsubStore?.();
     try { this.ws?.close(1000, 'call ended'); } catch { /* ignore */ }
+    void this.conv?.endSession?.().catch(() => {});
+    this.conv = null;
     this.mic?.stop();
     this.player.dispose();
     void this.ctx.close().catch(() => {});
@@ -423,7 +527,7 @@ class VoiceCall {
       setV({ status: 'error', error, speaking: false, listening: false, thinking: false, working: [] });
       setTimeout(() => { if (useVoice.getState().status === 'error' && !current) setV({ status: 'idle', botId: null, error: null }); }, 6000);
     } else {
-      setV({ status: 'idle', botId: null, callId: null, speaking: false, listening: false, thinking: false, working: [], startedAt: null });
+      setV({ status: 'idle', botId: null, callId: null, speaking: false, listening: false, thinking: false, working: [], startedAt: null, providerName: null });
     }
   }
 }
