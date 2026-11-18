@@ -71,7 +71,7 @@ export function spekoToolDefs(tools: { name: string; description: string; parame
       secret: spekoWebhookSecret(),
       // Per-call secret (session toolSecrets): never enters the prompt or transcript, only tool requests.
       headers: { 'X-Birdbot-Call': '{{call_token}}' },
-      timeoutMs: 20_000,
+      timeoutMs: 4_000, // Speko caps webhook tools at 4s; these all answer at once (send_task hands off and returns)
     },
   }));
 }
