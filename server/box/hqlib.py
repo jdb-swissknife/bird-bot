@@ -278,6 +278,8 @@ def base_env(n):
         'XDG_CURRENT_DESKTOP': 'XFCE',
         'NO_AT_BRIDGE': '1',
     }
+    if os.environ.get('TZ'):
+        env['TZ'] = os.environ['TZ']  # the user's time zone for the screen's clock and Chrome
     runtime = '/run/user/%d' % os.getuid()
     if os.path.isdir(runtime):
         env['XDG_RUNTIME_DIR'] = runtime

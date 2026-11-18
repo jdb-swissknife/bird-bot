@@ -23,6 +23,8 @@ function shellEnv(screenId?: string | null): NodeJS.ProcessEnv {
     USER: process.env.USER ?? 'root',
     LANG: process.env.LANG ?? 'C.UTF-8',
     DISPLAY: displayFor(screenId),
+    // The bot's screen (its clock, Chrome) runs in the user's time zone, not the computer's.
+    ...(process.env.TZ ? { TZ: process.env.TZ } : {}),
   };
 }
 
