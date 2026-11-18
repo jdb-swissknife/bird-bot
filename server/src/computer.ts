@@ -130,6 +130,23 @@ function saveSize(botId: string, s: OrgoScreen | undefined) {
   if (s?.width && s?.height) db.prepare('UPDATE screens SET width=?, height=? WHERE bot_id=?').run(s.width, s.height, botId);
 }
 
+let noScreensApiLogged = false;
+/**
+ * The computer's screens. Computers on Orgo's older desktop software have no screens endpoint (404):
+ * then only the boot screen exists, which is all the primary bot needs.
+ */
+async function listScreensSafe(id: string): Promise<OrgoScreen[]> {
+  try {
+    return await orgo.listScreens(id);
+  } catch (e) {
+    if (e instanceof OrgoError && e.status === 404) {
+      if (!noScreensApiLogged) { noScreensApiLogged = true; console.warn('[computer] this computer has no Orgo screens endpoint (older desktop software): using the boot screen only'); }
+      return [];
+    }
+    throw e;
+  }
+}
+
 /** This bot's screen on the shared computer; leases one the first time. */
 export function screenFor(userId: string, botId: string): Promise<BotScreen> {
   const running = leasing.get(botId);
@@ -162,7 +179,7 @@ async function lease(userId: string, botId: string): Promise<BotScreen> {
   }
 
   const taken = new Set((db.prepare('SELECT screen_id FROM screens').all() as any[]).map((r) => r.screen_id as string));
-  const existing = await orgo.listScreens(id);
+  const existing = await listScreensSafe(id);
   let screen: OrgoScreen | undefined;
   if (isPrimaryEngine(botId)) {
     screen = existing.find((s) => s.id === 'default' || s.default) ?? ({ id: 'default', display: ':99', width: 0, height: 0, default: true } as OrgoScreen);
@@ -171,7 +188,12 @@ async function lease(userId: string, botId: string): Promise<BotScreen> {
     screen = existing.find((s) => s.id !== 'default' && !s.default && !taken.has(s.id));
     if (!screen) {
       if (existing.length >= MAX_SCREENS) throw new Error(`Every screen on the computer is in use (${MAX_SCREENS} at most). Remove a bot to free one.`);
-      screen = await orgo.createScreen(id);
+      try {
+        screen = await orgo.createScreen(id);
+      } catch (e) {
+        if (e instanceof OrgoError && e.status === 404) throw new Error('This computer runs older Orgo desktop software without extra screens, so only the main bot has a screen. A newer Orgo computer (or an Orgo update) is needed for teammates to get their own.');
+        throw e;
+      }
     }
   }
   db.prepare('INSERT OR REPLACE INTO screens(bot_id,user_id,screen_id,last_used_at,width,height) VALUES (?,?,?,?,?,?)').run(botId, userId, screen.id, now(), screen.width || null, screen.height || null);
@@ -266,7 +288,7 @@ export async function refreshComputer(userId: string): Promise<ComputerState> {
     const r = rowFor(userId);
     if (s !== r.status || r.error) setStatus(userId, s);
     if (s === 'running') {
-      const screens = await orgo.listScreens(env.orgoComputerId);
+      const screens = await listScreensSafe(env.orgoComputerId);
       const byId = new Map(screens.map((x) => [x.default ? 'default' : x.id, x]));
       for (const row of db.prepare('SELECT bot_id, screen_id FROM screens WHERE user_id=?').all(userId) as any[]) saveSize(row.bot_id, byId.get(row.screen_id));
     }
